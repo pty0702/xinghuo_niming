@@ -1,0 +1,121 @@
+nd
+2	CLOSING
+3	CLOSED
+
+错误：
+
+Failed to execute 'send' on 'WebSocket': Still in CONNECTING state
+
+原因：连接还没 open 就 send。
+
+10. 当前协议闭环
+
+已确认闭环：
+
+WS open
+→ sign
+→ code=12
+→ random
+→ code=13
+→ code=15
+→ touser 发送消息
+→ code=7
+→ randomOut 离开
+
+未确认：
+
+randomOut 是否有专用回执
+code=18 / 19 具体含义
+heart 心跳格式
+VIP / 标签 / 地区筛选字段权限逻辑
+11. 最关键修正点
+
+相对最初版本，必须修正：
+
+1. sign 不能忽略。
+2. random 必须携带 id / preferSex / preferAddress / preferTag。
+3. random.id 必须等于 sign.id。
+4. randomOut 的对方 ID 字段是 msg，不是 sel_userid。
+5. touser 的对方 ID 和昵称拼在 act 里。
+6. touser.id 用 sign.id，不是 code=7.fromuser.id。
+7. sign.id 和服务端内部 ID 不是同一个。
+8. randomOut 未确认有 code=16 回执。
+12. 协议最小闭环示例
+Step 1：sign
+{
+  "act": "sign",
+  "id": "7qvte8f9vel8inmg3fsa1wp2blu1j9nj",
+  "name": "想要",
+  "userSex": "男",
+  "address_show": "false",
+  "randomhealthmode": "0",
+  "randomvipsex": "0",
+  "randomvipaddress": "0",
+  "userip": "222.222.181.194",
+  "useraddree": "河北省保定市",
+  "randomvipcode": ""
+}
+
+返回：
+
+{
+  "code": 12,
+  "content": "连接服务器成功！"
+}
+Step 2：random
+{
+  "act": "random",
+  "id": "7qvte8f9vel8inmg3fsa1wp2blu1j9nj",
+  "preferSex": null,
+  "preferAddress": false,
+  "preferTag": null
+}
+
+返回：
+
+{
+  "code": 13,
+  "content": "已进入匹配队列"
+}
+
+随后：
+
+{
+  "code": 15,
+  "sel_userid": "e3468bc49cbaa0ca25e4bc9ed584b3fa",
+  "sel_userNikename": "1098312437",
+  "sel_userSex": "女",
+  "sel_userAge": 18,
+  "sel_userAddress": "保密",
+  "sel_userTag": ""
+}
+Step 3：发送消息
+{
+  "act": "touser_e3468bc49cbaa0ca25e4bc9ed584b3fa_1098312437",
+  "id": "7qvte8f9vel8inmg3fsa1wp2blu1j9nj",
+  "msg": "1"
+}
+
+返回：
+
+{
+  "code": 7,
+  "fromuser": {
+    "id": "9a5a7a39481f71cc8eb71cb7f7e698e1",
+    "nickname": "想要",
+    "content": "1",
+    "time": "2026-05-12 16:51:07.813"
+  },
+  "touser": {
+    "id": "e3468bc49cbaa0ca25e4bc9ed584b3fa",
+    "nickname": "1098312437"
+  }
+}
+Step 4：离开
+{
+  "act": "randomOut",
+  "id": "7qvte8f9vel8inmg3fsa1wp2blu1j9nj",
+  "msg": "e3468bc49cbaa0ca25e4bc9ed584b3fa"
+}
+
+无明确专用回执。
