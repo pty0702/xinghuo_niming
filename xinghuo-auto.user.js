@@ -422,8 +422,9 @@
 
     var bootTries = 0;
     function boot() {
-        if (typeof window.sendJson !== 'function' || typeof window.ws === 'undefined') {
-            if (bootTries++ < 300) return setTimeout(boot, 100);
+        // 只等页面核心函数就绪，不等 ws：WS 可能还没连上，面板要尽早出来
+        if (typeof window.sendJson !== 'function') {
+            if (bootTries++ < 600) return setTimeout(boot, 100);
             return;
         }
         installLimitHook();
