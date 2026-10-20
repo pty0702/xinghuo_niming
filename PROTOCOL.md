@@ -175,6 +175,56 @@ $("#btn_random_break").click(function() {
 
 ---
 
+## 四之二、匹配后 30 秒禁发（isFirstMatch）实测
+
+### 双层校验
+
+**前端**两处，都调 `randomGetIDTimeLimit()`：
+
+| 位置 | 场景 | 提示 |
+|---|---|---|
+| `rdk3.boot.js` 发送消息分支 | 文本含链接 | 「匹配后前30秒不允许发送链接，请稍后再试」 |
+| `rdk3.upload.js` 粘贴/选图 | 图片 | 「匹配后前30秒不允许发送图片，请稍后再试」 |
+
+前端判定函数（`rdk3.ws-chat.js:2285`）：
+
+```js
+function randomGetIDTimeLimit() {
+    if (!matchBlockTargetMd5 || !matchBlockUntil) return false;
+    if (sel_userid != matchBlockTargetMd5) return false;
+    return Date.now() < matchBlockUntil;   // 30 秒窗口，仅 isFirstMatch=1 时设置
+}
+```
+
+**后端**兜底：消息若被判为链接/图片/文件，服务端直接丢弃并回
+
+```json
+{"code":24,"content":"匹配成功后 30 秒内不能发送链接/图片/文件，请稍后再试"}
+```
+
+### 实测矩阵（2026-10-20，`isFirstMatch=1` 窗口内逐条发送）
+
+| 发送内容 | 结果 | 说明 |
+|---|---|---|
+| `http://baidu.com` | ❌ code=24 | 原型，拦 |
+| `www . baidu . com`（空格分隔） | ❌ code=24 | 服务端会先剥离空白再匹配 |
+| `www.bai\u200bdu.com`（零宽） | ❌ code=24 | 零宽字符同样被归一化掉 |
+| `ｗｗｗ．ｂａｉｄｕ．ｃｏｍ`（全角） | ✅ 通过 | 但服务端转码会把全角字符弄成乱码，实测不可用 |
+| `www。baidu。com`（U+3002 中文句号） | ✅ **通过** | 回显正常可读，服务端只认半角 `.` |
+| `[/img/sys/logo.png]`（相对路径图片消息） | ❌ code=24 | 媒体消息不看路径形态，`[...]` 直接拦 |
+| `[https://xinghuo.chat/img/sys/logo.png]` | ❌ code=24 | 同上 |
+| 纯中文文本 | ✅ 通过 | 与 30 秒无关 |
+
+窗口到期验证：匹配成功 32 秒后发 `http://baidu.com` → ✅ 正常投递（code=7 回显）。
+
+### 结论
+
+1. **文本链接**：把 `.` 换成 `。` 就能立刻发，服务端和对方看到的都是可读文本（复制后手动改回 `.` 即可）。
+2. **图片/文件**：服务端按消息形态硬拦，`[...]` 无论内容是绝对 URL 还是相对路径一律拒绝，**30 秒内无协议级解法**。可行的是「排队补发」：客户端先扣住这条消息，到 `matchBlockUntil` 自动发出。
+3. 顺带验证：`isFirstMatch=0`（与对方有过联系记录的老朋友）**完全不受 30 秒限制**，此时发链接和图片都直接通过。
+
+---
+
 ## 五、绕过方案
 
 ### 方案 0：自己写 WS 客户端（最彻底）
@@ -208,7 +258,15 @@ ws.send(JSON.stringify({ act: "randomOut", id: getSocketUserId(), msg: sel_useri
 
 ### 方案 5：油猴脚本常驻（推荐）
 
-见同目录 `xinghuo-bypass-3s.user.js`，自动 hook 匹配成功回调，把计时起点往前推 4 秒，同时给 `isVip()` 打一个只在 5 秒窗口内生效的补丁。
+- `xinghuo-bypass-3s.user.js`：只管 3 秒离开限制，hook 匹配回调把计时起点往前推 4 秒，附带 `Ctrl+Shift+X` 热键直发 `randomOut`。
+- `xinghuo-auto.user.js`（v2.0 全套）：
+  - 自动匹配，可勾选只聊「女 / 保密 / 男」，非目标性别自动 `randomOut` 后重新入队
+  - 命中目标后按延迟自动发送开场文案（多条随机、支持 `{name}` `{city}` `{sex}` 占位符）
+  - `randomGetIDTime = 匹配时间 - 4s`，离开按钮永不拦
+  - 覆盖 `randomGetIDTimeLimit()` 恒返回 false，前端不再提示
+  - 包装 `sendJson`：30 秒窗口内的文本链接自动把 `.` 换成 `。` 立即发出（`obfuscate` 模式），或排队到窗口结束原样补发（`queue` 模式）
+  - 图片/文件消息在窗口内扣住，到点自动补发，不会撞 code=24
+  - 右下角悬浮面板，配置存 `localStorage('xh_auto_cfg_v2')`
 
 ---
 
