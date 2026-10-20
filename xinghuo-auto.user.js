@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星火匿名聊 · 自动匹配 + 3秒离开 + 30秒禁发 全套
 // @namespace    local.xinghuo
-// @version      2.1
+// @version      2.2
 // @description  自动匹配（只聊女/保密，男的自动跳过）、自动开场文案、绕过匹配后3秒禁止离开、绕过匹配后30秒禁止发链接/图片
 // @match        https://xinghuo.chat/*
 // @run-at       document-idle
@@ -32,6 +32,8 @@
         skipDelayMs: 600,                // 匹配到非目标性别后多久踢掉
         matchIntervalMs: 2000,           // 匹配节奏：两次发起 random 的最小间隔（毫秒）
         queueTimeoutMs: 20000,           // 排队多久没结果就重发 random
+        continueOnLeave: true,           // 对方离开 / 离线后自动继续匹配
+        dupMode: 'silent',               // 重复匹配到同一 id：silent=不再发文案 | skip=直接踢掉换人
         bypass3s: true,                  // 匹配成功立即允许离开
         bypass30s: true,                 // 处理 30 秒禁发
         linkMode: 'obfuscate',           // obfuscate=点换句号立即发 | queue=排队等窗口结束
@@ -40,6 +42,25 @@
 
     var cfg = loadCfg();
     var stat = { match: 0, skip: 0, greet: 0, queued: 0 };
+
+    /* --------------------------------------------------- 已打过招呼的对象池 */
+
+    var GREET_KEY = 'xh_greeted_ids_v1';
+    var greeted = (function () {
+        try { return JSON.parse(localStorage.getItem(GREET_KEY) || '{}') || {}; }
+        catch (e) { return {}; }
+    })();
+
+    function saveGreeted() {
+        try {
+            var keys = Object.keys(greeted);
+            if (keys.length > 3000) {   // 只保留最近 3000 个，防止无限膨胀
+                keys.sort(function (a, b) { return greeted[a] - greeted[b]; });
+                for (var i = 0; i < keys.length - 3000; i++) delete greeted[keys[i]];
+            }
+            localStorage.setItem(GREET_KEY, JSON.stringify(greeted));
+        } catch (e) { }
+    }
 
     function loadCfg() {
         try {
@@ -223,42 +244,73 @@
         } catch (e) { }
     }
 
+    // 踢掉当前匹配对象，按节奏继续摇人
+    function skipPeer(d, reason) {
+        stat.skip++;
+        log('跳过 ' + (d.sel_userSex || '') + ' / ' + (d.sel_userNikename || '') +
+            '（' + reason + '，累计跳过 ' + stat.skip + '）');
+        setTimeout(function () {
+            try {
+                if (wsReady()) {
+                    var raw = window.sendJson.__raw || window.sendJson;
+                    raw.call(window, 'randomOut', d.sel_userid, true);
+                }
+            } catch (e) { }
+            // 页面不会自己清，手动清掉，否则 tick 会把我们当成"正在聊天"
+            try { if (window.sel_userid === d.sel_userid) window.sel_userid = ''; } catch (e) { }
+            doRandom();
+        }, cfg.skipDelayMs);
+    }
+
     function onMatch(d) {
         var sex = d.sel_userSex || '';
-        var isTarget = (cfg.targetSex || []).indexOf(sex) >= 0;
+        var pid = d.sel_userid || '';
 
-        if (!isTarget) {
-            stat.skip++;
-            log('跳过 ' + sex + ' / ' + (d.sel_userNikename || '') + '（累计跳过 ' + stat.skip + '）');
-            setTimeout(function () {
-                try {
-                    if (wsReady()) {
-                        var raw = window.sendJson.__raw || window.sendJson;
-                        raw.call(window, 'randomOut', d.sel_userid, true);
-                    }
-                } catch (e) { }
-                // 页面不会自己清，手动清掉，否则 tick 会把我们当成"正在聊天"
-                try { if (window.sel_userid === d.sel_userid) window.sel_userid = ''; } catch (e) { }
-                doRandom();
-            }, cfg.skipDelayMs);
+        if ((cfg.targetSex || []).indexOf(sex) < 0) {
+            skipPeer(d, '性别不符');
             return;
         }
 
         stat.match++;
+        var seen = !!greeted[pid];
+
+        if (seen && cfg.dupMode === 'skip') {
+            skipPeer(d, '这个 id 聊过了');
+            return;
+        }
+
+        if (seen) {
+            log('命中 重复 ' + sex + ' / ' + (d.sel_userNikename || '') + '，已打过招呼，不再发');
+            return;
+        }
+
         log('命中 ' + sex + ' / ' + (d.sel_userNikename || '') + ' / ' + (d.sel_userAddress || '') +
             '（累计命中 ' + stat.match + '）');
 
         var text = pickGreeting(d);
         if (!text) return;
-        setTimeout(function () {
-            if (window.sel_userid !== d.sel_userid) return;      // 期间换人了就别发
-            if (!wsReady()) return;
+        setTimeout(function () { deliverGreeting(d, text, 0); }, cfg.greetDelayMs);
+    }
+
+    // 发开场白。ws 抖动（服务端时不时掐连接）时排队重试，别白白丢掉
+    function deliverGreeting(d, text, tries) {
+        if (!cfg.enabled) return;
+        if (wsReady()) {
+            // 只有已经换成别的对象时才放弃；sel_userid 被页面清空仍可发
+            if (window.sel_userid && window.sel_userid !== d.sel_userid) return;
             try {
                 window.sendJson('touser_' + d.sel_userid + '_' + (d.sel_userNikename || ''), text, true);
                 stat.greet++;
+                greeted[d.sel_userid] = Date.now();
+                saveGreeted();
                 log('已发开场白：' + text);
             } catch (e) { log('开场白发送失败 ' + e); }
-        }, cfg.greetDelayMs);
+            return;
+        }
+        if (tries < 15) {
+            if (tries === 0) log('ws 未就绪，开场白排队重试');
+            setTimeout(function () { deliverGreeting(d, text, tries + 1); }, 800);
+        }
     }
 
     function onSocketMessage(ev) {
@@ -269,9 +321,11 @@
         if (data.code === 15) { onMatch(data); return; }
         if (data.code === 16 || data.code === 3 || data.code === 40) {
             // 对方走了 / 离线 / 被清理：清掉残留会话，按节奏继续匹配
+            if (!cfg.continueOnLeave) return;
             setTimeout(function () {
                 if (!cfg.enabled) return;
                 if (window.sel_userid) { try { window.sel_userid = ''; } catch (e) { } }
+                log('对方离开（code=' + data.code + '），继续匹配');
                 doRandom();
             }, 800);
         }
@@ -281,7 +335,15 @@
     var hookedWs = null;
     function keepSocketHooked() {
         if (window.ws && window.ws !== hookedWs && window.ws.readyState <= 1) {
-            if (hookedWs) log('连接已重建，重新挂监听');
+            if (hookedWs) {
+                log('连接已重建，重新挂监听');
+                // 断线重连后服务端那边的匹配关系已经不可信，清掉残留会话继续摇人，
+                // 否则 sel_userid 会一直占着，tick 以为你在聊天，整个流程卡死
+                if (cfg.enabled) {
+                    try { window.sel_userid = ''; } catch (e) { }
+                    setTimeout(function () { if (cfg.enabled) doRandom(); }, 1200);
+                }
+            }
             hookedWs = window.ws;
             try { hookedWs.addEventListener('message', onSocketMessage); } catch (e) { }
         }
@@ -441,6 +503,53 @@
         sel2.onchange = function () { cfg.fileMode = sel2.value; saveCfg(); };
         body.appendChild(sel2);
 
+        // 对方离开后继续匹配
+        var rowLeave = document.createElement('label');
+        rowLeave.style.cssText = 'display:flex;align-items:center;gap:6px;margin:8px 0 4px';
+        var chkLeave = document.createElement('input');
+        chkLeave.type = 'checkbox';
+        chkLeave.checked = !!cfg.continueOnLeave;
+        chkLeave.onchange = function () {
+            cfg.continueOnLeave = chkLeave.checked;
+            saveCfg();
+            log('对方离开后' + (cfg.continueOnLeave ? '继续匹配' : '不再自动匹配'));
+        };
+        rowLeave.appendChild(chkLeave);
+        rowLeave.appendChild(document.createTextNode('对方离开后继续匹配'));
+        body.appendChild(rowLeave);
+
+        // 重复对象
+        var lblDup = document.createElement('div');
+        lblDup.textContent = '匹配到聊过的 id：';
+        lblDup.style.cssText = 'margin:2px 0 2px;color:#9aa';
+        body.appendChild(lblDup);
+        var selDup = document.createElement('select');
+        selDup.style.cssText = sel.style.cssText;
+        [['silent', '不再发文案，留着聊'], ['skip', '直接踢掉，继续换人']].forEach(function (o) {
+            var op = document.createElement('option');
+            op.value = o[0]; op.textContent = o[1];
+            if (cfg.dupMode === o[0]) op.selected = true;
+            selDup.appendChild(op);
+        });
+        selDup.onchange = function () { cfg.dupMode = selDup.value; saveCfg(); log('重复对象处理：' + selDup.options[selDup.selectedIndex].textContent); };
+        body.appendChild(selDup);
+
+        // 清空记录
+        var btnClear = document.createElement('button');
+        btnClear.style.cssText = 'width:100%;margin-top:6px;background:#2b2f36;color:#ddd;border:1px solid #3a3f47;' +
+            'border-radius:4px;padding:3px;cursor:pointer;font:11px inherit';
+        function refreshClear() {
+            btnClear.textContent = '清空「已打招呼」记录（' + Object.keys(greeted).length + ' 个）';
+        }
+        refreshClear();
+        btnClear.onclick = function () {
+            greeted = {};
+            saveGreeted();
+            refreshClear();
+            log('已清空打招呼记录，重复对象会被重新打招呼');
+        };
+        body.appendChild(btnClear);
+
         // 日志
         logEl = document.createElement('pre');
         logEl.style.cssText = 'margin:8px 0 0;height:96px;overflow:auto;background:#0e1013;color:#8bc34a;' +
@@ -501,7 +610,7 @@
         keepSocketHooked();
         buildPanel();
         startTicker();
-        log('已加载 v2.1');
+        log('已加载 v2.2');
     }
     boot();
 
