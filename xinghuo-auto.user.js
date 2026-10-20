@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星火匿名聊 · 自动匹配 + 3秒离开 + 30秒禁发 全套
 // @namespace    local.xinghuo
-// @version      2.2
+// @version      2.3
 // @description  自动匹配（只聊女/保密，男的自动跳过）、自动开场文案、绕过匹配后3秒禁止离开、绕过匹配后30秒禁止发链接/图片
 // @match        https://xinghuo.chat/*
 // @run-at       document-idle
@@ -30,7 +30,7 @@
         greetings: ['你好呀，一个人吗？'],
         greetDelayMs: 1200,              // 匹配成功后多久发开场白
         skipDelayMs: 600,                // 匹配到非目标性别后多久踢掉
-        matchIntervalMs: 2000,           // 匹配节奏：两次发起 random 的最小间隔（毫秒）
+        matchIntervalMs: 3000,           // 匹配节奏：两次发起 random 的最小间隔（毫秒，低于2500容易被限流）
         queueTimeoutMs: 20000,           // 排队多久没结果就重发 random
         continueOnLeave: true,           // 对方离开 / 离线后自动继续匹配
         dupMode: 'silent',               // 重复匹配到同一 id：silent=不再发文案 | skip=直接踢掉换人
@@ -82,6 +82,33 @@
 
     function wsReady() { return window.ws && window.ws.readyState === 1; }
     function uid() { try { return window.getSocketUserId(); } catch (e) { return null; } }
+
+    // 换新身份：getRandnikename 每次白送一套 (id, token, 昵称)，写进 cookie 刷新即生效
+    // 限流（code=-1）、身份校验失败（code=25）、被封时用它
+    function reborn() {
+        var keepNick = '';
+        try { keepNick = jQuery.cookie('user_nickname_random') || ''; } catch (e) { }
+        log('正在领取新身份…');
+        fetch('/asmx/method.asmx/getRandnikename', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ act: 'getRanNick' })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+            if (!j || j.state !== 'OK' || !j.msg || !j.msg.id) {
+                log('换身份失败：' + (j && j.msg ? j.msg : '服务端没给身份'));
+                return;
+            }
+            try { clearChatToken(); } catch (e) { }      // 内存 + cookie 的旧票一起清
+            try {
+                jQuery.cookie('user_id', j.msg.id, { expires: 365, path: '/' });
+                jQuery.cookie('user_nickname_random', keepNick || j.msg.nickname, { expires: 365, path: '/' });
+            } catch (e) { }
+            try { setChatToken(j.msg.token); } catch (e) { }
+            try { localStorage.setItem('xh_reborn_at', String(Date.now())); } catch (e) { }
+            log('已换新身份 ' + j.msg.id.slice(0, 8) + '，刷新中');
+            setTimeout(function () { location.reload(); }, 700);
+        }).catch(function (e) { log('换身份失败：' + e); });
+    }
 
     // 是否处在「匹配成功后 30 秒」窗口内（页面自己维护的变量）
     function inFirstWindow() {
@@ -208,9 +235,49 @@
     var lastRandomAt = 0;
     var randomPending = null;
 
+    // 服务端限流：code=-1（「匹配过于频繁」/「发送消息过于频繁」），按身份计
+    // 实测约 10~20 条 WS 动作 / 10 秒就会触发，触发后指数退避
+    var backoffUntil = 0;
+    var backoffStep = 0;
+
+    // 刚换过身份时先冷启动 20 秒再开刷：新号 0.5 秒就进队列狂摇太像机器
+    var rebornAt = 0;
+    try { rebornAt = parseInt(localStorage.getItem('xh_reborn_at') || '0', 10) || 0; } catch (e) { }
+    var warmupUntil = rebornAt ? rebornAt + 20000 : 0;
+
+    function onRateLimited(content) {
+        backoffStep = Math.min(backoffStep + 1, 4);          // 5s → 10s → 20s → 40s → 60s
+        var wait = Math.min(60000, 5000 * Math.pow(2, backoffStep - 1));
+        backoffUntil = Date.now() + wait;
+        if (randomPending) { clearTimeout(randomPending); randomPending = null; }
+        log('被限流：' + (content || '频率过高') + '，暂停 ' + Math.round(wait / 1000) + ' 秒');
+    }
+
     // 发起匹配。所有调用都会被 matchIntervalMs 统一节流：
     // 来早了不丢弃，排到点自动发，保证「N 秒一个」的节奏稳定
     function doRandom() {
+        if (Date.now() < warmupUntil) {
+            if (randomPending) return;
+            var wLeft = warmupUntil - Date.now();
+            if (!doRandom.__warmLogged) {
+                doRandom.__warmLogged = true;
+                log('新身份冷启动中，' + Math.ceil(wLeft / 1000) + ' 秒后再开始匹配');
+            }
+            randomPending = setTimeout(function () {
+                randomPending = null;
+                doRandom();
+            }, wLeft + 200);
+            return;
+        }
+        if (Date.now() < backoffUntil) {
+            if (randomPending) return;
+            var left = backoffUntil - Date.now();
+            randomPending = setTimeout(function () {
+                randomPending = null;
+                doRandom();
+            }, left + 200);
+            return;
+        }
         if (!wsReady()) {
             if (cfg.enabled) log('ws 未就绪，等重连');
             return;
@@ -272,6 +339,7 @@
         }
 
         stat.match++;
+        backoffStep = 0;                 // 能匹配上说明限流已解除
         var seen = !!greeted[pid];
 
         if (seen && cfg.dupMode === 'skip') {
@@ -318,6 +386,7 @@
         try { data = JSON.parse(ev.data); } catch (e) { return; }
         if (!cfg.enabled) return;
 
+        if (data.code === -1) { onRateLimited(data.content); return; }
         if (data.code === 15) { onMatch(data); return; }
         if (data.code === 16 || data.code === 3 || data.code === 40) {
             // 对方走了 / 离线 / 被清理：清掉残留会话，按节奏继续匹配
@@ -550,6 +619,25 @@
         };
         body.appendChild(btnClear);
 
+        // 换新身份（服务端白送：getRandnikename 每次给一套全新 id + token）
+        // 限流、封禁、身份校验失败（code=25）时用这个最直接
+        var btnReborn = document.createElement('button');
+        btnReborn.style.cssText = 'width:100%;margin-top:4px;background:#3a2b2b;color:#ffb4b4;border:1px solid #5a3a3a;' +
+            'border-radius:4px;padding:3px;cursor:pointer;font:11px inherit';
+        btnReborn.textContent = '🔄 换新身份（当前 ' + String(uid() || '未连接').slice(0, 8) + '）';
+        btnReborn.onclick = function () {
+            var tip = '换身份会丢：收藏 / VIP 激活码绑定 / 当前聊天对象。<br/>配置和「已打招呼」记录保留。<br/>确定换吗？';
+            if (window.layer && layer.confirm) {
+                layer.confirm(tip, { btn: ['换', '取消'], title: '' }, function (i) {
+                    layer.close(i);
+                    reborn();
+                });
+            } else if (confirm('换身份会丢失收藏和VIP绑定，确定？')) {
+                reborn();
+            }
+        };
+        body.appendChild(btnReborn);
+
         // 日志
         logEl = document.createElement('pre');
         logEl.style.cssText = 'margin:8px 0 0;height:96px;overflow:auto;background:#0e1013;color:#8bc34a;' +
@@ -610,7 +698,7 @@
         keepSocketHooked();
         buildPanel();
         startTicker();
-        log('已加载 v2.2');
+        log('已加载 v2.3');
     }
     boot();
 
