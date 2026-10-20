@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         星火匿名聊 · 自动匹配 + 3秒离开 + 30秒禁发 全套
 // @namespace    local.xinghuo
-// @version      2.0
+// @version      2.1
 // @description  自动匹配（只聊女/保密，男的自动跳过）、自动开场文案、绕过匹配后3秒禁止离开、绕过匹配后30秒禁止发链接/图片
 // @match        https://xinghuo.chat/*
 // @run-at       document-idle
@@ -30,6 +30,7 @@
         greetings: ['你好呀，一个人吗？'],
         greetDelayMs: 1200,              // 匹配成功后多久发开场白
         skipDelayMs: 600,                // 匹配到非目标性别后多久踢掉
+        matchIntervalMs: 2000,           // 匹配节奏：两次发起 random 的最小间隔（毫秒）
         queueTimeoutMs: 20000,           // 排队多久没结果就重发 random
         bypass3s: true,                  // 匹配成功立即允许离开
         bypass30s: true,                 // 处理 30 秒禁发
@@ -184,19 +185,42 @@
     /* ------------------------------------------------------------ 自动匹配 */
 
     var lastRandomAt = 0;
-    var busy = false;
+    var randomPending = null;
 
-    function doRandom(force) {
-        if (!wsReady()) return;
-        var now = Date.now();
-        if (!force && now - lastRandomAt < 1500) return;
-        lastRandomAt = now;
+    // 发起匹配。所有调用都会被 matchIntervalMs 统一节流：
+    // 来早了不丢弃，排到点自动发，保证「N 秒一个」的节奏稳定
+    function doRandom() {
+        if (!wsReady()) {
+            if (cfg.enabled) log('ws 未就绪，等重连');
+            return;
+        }
+        var wait = (cfg.matchIntervalMs || 2000) - (Date.now() - lastRandomAt);
+        if (wait > 0) {
+            if (randomPending) return;
+            randomPending = setTimeout(function () {
+                randomPending = null;
+                doRandom();
+            }, wait);
+            return;
+        }
+        if (randomPending) { clearTimeout(randomPending); randomPending = null; }
+
+        lastRandomAt = Date.now();
         try {
-            var $btn = window.jQuery ? window.jQuery('#btn_random') : null;
-            if ($btn && $btn.length) $btn.trigger('click');   // 复用页面逻辑，顺便复位 UI
-            else window.sendJson('random', '', true);
+            window.sendJson('random', '', true);    // 直接发协议帧，不依赖按钮和页面状态
+            resetUiIdle();
             log('进入匹配队列');
         } catch (e) { log('random 失败 ' + e); }
+    }
+
+    // 匹配中把聊天输入区收起来（等价于点「开始匹配」时的 UI 表现）
+    function resetUiIdle() {
+        try {
+            if (!window.jQuery) return;
+            jQuery('.input-main').hide();
+            jQuery('#btn_random').show();
+            jQuery('#btn_random_break,#btn_random_return').hide();
+        } catch (e) { }
     }
 
     function onMatch(d) {
@@ -213,7 +237,9 @@
                         raw.call(window, 'randomOut', d.sel_userid, true);
                     }
                 } catch (e) { }
-                setTimeout(function () { doRandom(true); }, cfg.skipDelayMs);
+                // 页面不会自己清，手动清掉，否则 tick 会把我们当成"正在聊天"
+                try { if (window.sel_userid === d.sel_userid) window.sel_userid = ''; } catch (e) { }
+                doRandom();
             }, cfg.skipDelayMs);
             return;
         }
@@ -242,8 +268,12 @@
 
         if (data.code === 15) { onMatch(data); return; }
         if (data.code === 16 || data.code === 3 || data.code === 40) {
-            // 对方走了 / 离线，回到队列
-            setTimeout(function () { if (!window.sel_userid) doRandom(true); }, 800);
+            // 对方走了 / 离线 / 被清理：清掉残留会话，按节奏继续匹配
+            setTimeout(function () {
+                if (!cfg.enabled) return;
+                if (window.sel_userid) { try { window.sel_userid = ''; } catch (e) { } }
+                doRandom();
+            }, 800);
         }
     }
 
@@ -251,6 +281,7 @@
     var hookedWs = null;
     function keepSocketHooked() {
         if (window.ws && window.ws !== hookedWs && window.ws.readyState <= 1) {
+            if (hookedWs) log('连接已重建，重新挂监听');
             hookedWs = window.ws;
             try { hookedWs.addEventListener('message', onSocketMessage); } catch (e) { }
         }
@@ -262,8 +293,8 @@
         installSendHook();
         if (!cfg.enabled || !wsReady()) return;
         if (window.sel_userid) return;                       // 正在聊
-        if (Date.now() - lastRandomAt < cfg.queueTimeoutMs) return;
-        doRandom(true);                                      // 排队超时，重新入队
+        if (Date.now() - lastRandomAt < (cfg.matchIntervalMs || 2000)) return;
+        doRandom();                                          // 到点了，继续摇人
     }
 
     /* ------------------------------------------------------------- 面板 UI */
@@ -336,6 +367,31 @@
             row2.appendChild(lb);
         });
         body.appendChild(row2);
+
+        // 匹配节奏
+        var rowSpeed = document.createElement('div');
+        rowSpeed.style.cssText = 'display:flex;align-items:center;gap:6px;margin:4px 0 2px';
+        rowSpeed.appendChild(document.createTextNode('匹配间隔'));
+        var inpSpeed = document.createElement('input');
+        inpSpeed.type = 'number';
+        inpSpeed.min = '500';
+        inpSpeed.max = '20000';
+        inpSpeed.step = '100';
+        inpSpeed.value = cfg.matchIntervalMs;
+        inpSpeed.style.cssText = 'width:72px;background:#111;color:#ddd;border:1px solid #3a3f47;' +
+            'border-radius:4px;padding:2px 4px;font:12px inherit';
+        inpSpeed.onchange = function () {
+            var v = parseInt(inpSpeed.value, 10);
+            if (isNaN(v) || v < 500) v = 500;
+            if (v > 20000) v = 20000;
+            cfg.matchIntervalMs = v;
+            inpSpeed.value = v;
+            saveCfg();
+            log('匹配间隔 ' + v + 'ms（约 ' + (1000 / v).toFixed(1) + ' 个/秒）');
+        };
+        rowSpeed.appendChild(inpSpeed);
+        rowSpeed.appendChild(document.createTextNode('ms / 个'));
+        body.appendChild(rowSpeed);
 
         // 文案
         var lbl3 = document.createElement('div');
@@ -418,6 +474,19 @@
         document.addEventListener('mouseup', function () { dragging = false; });
     }
 
+    // 后台标签页的 setInterval 会被浏览器节流（最低 1s，挂久了更慢），
+    // 用 Web Worker 计时器兜住，保证「N 秒一个」在挂后台时也准
+    function startTicker() {
+        try {
+            var src = 'setInterval(function(){postMessage(0)},400)';
+            var url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+            var w = new Worker(url);
+            w.onmessage = function () { tick(); };
+            return;
+        } catch (e) { }
+        setInterval(tick, 500);   // CSP 挡住 Worker 时退回普通计时器
+    }
+
     /* --------------------------------------------------------------- 启动 */
 
     var bootTries = 0;
@@ -431,8 +500,8 @@
         installSendHook();
         keepSocketHooked();
         buildPanel();
-        setInterval(tick, 800);
-        log('已加载 v2.0');
+        startTicker();
+        log('已加载 v2.1');
     }
     boot();
 
